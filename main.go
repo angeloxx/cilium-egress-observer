@@ -60,6 +60,7 @@ func main() {
 	var loadBalancerClass string
 	var k8sClientQPS int
 	var k8sClientBurst int
+	var backgroundCheckerSeconds int
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -71,6 +72,7 @@ func main() {
 			"Enabling this will ensure there is only one active controller manager.")
 	flag.IntVar(&k8sClientQPS, "k8s-client-qps", 20, "The maximum QPS to the Kubernetes API server")
 	flag.IntVar(&k8sClientBurst, "k8s-client-burst", 100, "The maximum burst for throttle to the Kubernetes API server")
+	flag.IntVar(&backgroundCheckerSeconds, "background-checker-seconds", 60, "The time in seconds to check all the HAEgressGatewayPolicies in the background, zero to disable it")
 	opts := zap.Options{
 		Development: false,
 	}
@@ -112,12 +114,13 @@ func main() {
 	}
 
 	if err = (&controllers.HAEgressGatewayPolicyReconciler{
-		Client:            mgr.GetClient(),
-		Log:               ctrl.Log.WithName("controllers").WithName("HAEgressGatewayPolicy"),
-		Scheme:            mgr.GetScheme(),
-		Recorder:          mgr.GetEventRecorderFor("cilium-haegress-operator"),
-		EgressNamespace:   haegressNamespace,
-		LoadBalancerClass: loadBalancerClass,
+		Client:                   mgr.GetClient(),
+		Log:                      ctrl.Log.WithName("controllers").WithName("HAEgressGatewayPolicy"),
+		Scheme:                   mgr.GetScheme(),
+		Recorder:                 mgr.GetEventRecorderFor("cilium-haegress-operator"),
+		EgressNamespace:          haegressNamespace,
+		LoadBalancerClass:        loadBalancerClass,
+		BackgroundCheckerSeconds: backgroundCheckerSeconds,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "HAEgressGatewayPolicy")
 		os.Exit(1)

@@ -34,9 +34,15 @@ func SyncServiceWithCiliumEgressGatewayPolicy(ctx context.Context, r client.Clie
 	currentHost := string(service.Annotations[haegressip.KubeVIPVipHostAnnotation])
 
 	if len(service.Status.LoadBalancer.Ingress) > 0 {
-		if ciliumEgressGatewayPolicy.Spec.EgressGateway.EgressIP != service.Status.LoadBalancer.Ingress[0].IP {
-			ciliumEgressGatewayPolicy.Spec.EgressGateway.EgressIP = service.Status.LoadBalancer.Ingress[0].IP
-			if err := r.Update(ctx, &ciliumEgressGatewayPolicy); err != nil {
+		// Fetch updated version of the object in order to avoid to update with stale data
+		var ciliumEgressGatewayPolicyUpdated = ciliumv2.CiliumEgressGatewayPolicy{}
+		if err := r.Get(ctx, types.NamespacedName{Name: ciliumEgressGatewayPolicy.Name, Namespace: ciliumEgressGatewayPolicy.Namespace}, &ciliumEgressGatewayPolicyUpdated); err != nil {
+			logger.Error(err, "unable to fetch the CiliumEgressGatewayPolicy, during refresh before the update")
+			return ctrl.Result{RequeueAfter: haegressip.HAEgressGatewayPolicyChcekRequeueAfter}, err
+		}
+		if ciliumEgressGatewayPolicyUpdated.Spec.EgressGateway.EgressIP != service.Status.LoadBalancer.Ingress[0].IP {
+			ciliumEgressGatewayPolicyUpdated.Spec.EgressGateway.EgressIP = service.Status.LoadBalancer.Ingress[0].IP
+			if err := r.Update(ctx, &ciliumEgressGatewayPolicyUpdated); err != nil {
 				logger.Error(err, "unable to update the CiliumEgressGatewayPolicy with new assigned IP, retry later")
 				return ctrl.Result{RequeueAfter: haegressip.HAEgressGatewayPolicyChcekRequeueAfter}, nil
 			}
