@@ -39,16 +39,20 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sync/atomic"
+	"time"
 )
 
 // HAEgressGatewayPolicyReconciler reconciles a HAEgressGatewayPolicy object
 type HAEgressGatewayPolicyReconciler struct {
 	client.Client
-	Log               logr.Logger
-	Scheme            *runtime.Scheme
-	Recorder          record.EventRecorder
-	EgressNamespace   string
-	LoadBalancerClass string
+	Log                      logr.Logger
+	Scheme                   *runtime.Scheme
+	Recorder                 record.EventRecorder
+	EgressNamespace          string
+	LoadBalancerClass        string
+	BackgroundCheckerSeconds int
+	lastServiceUpdate        atomic.Value
 }
 
 //+kubebuilder:rbac:groups=cilium.angeloxx.ch,resources=haegressgatewaypolicies,verbs=get;list;watch;create;update;patch;delete
@@ -69,6 +73,7 @@ func (r *HAEgressGatewayPolicyReconciler) Reconcile(ctx context.Context, req ctr
 
 	var haEgressGatewayPolicy haegressv2.HAEgressGatewayPolicy
 
+	// Check if the resource is available, eg. if Reconcile was called due a delete
 	if err := r.Get(ctx, req.NamespacedName, &haEgressGatewayPolicy); err != nil {
 		if apierrors.IsNotFound(err) {
 			// we'll ignore not-found errors, since they can't be fixed by an immediate
@@ -96,6 +101,10 @@ func (r *HAEgressGatewayPolicyReconciler) Reconcile(ctx context.Context, req ctr
 
 func (r *HAEgressGatewayPolicyReconciler) UpdateOrCreateCiliumEgressGatewayPolicy(ctx context.Context, haEgressGatewayPolicy *haegressv2.HAEgressGatewayPolicy) error {
 	log := ctrl.LoggerFrom(ctx)
+
+	// Save the last update date in order to delay the next background check
+	r.lastServiceUpdate.Store(time.Now())
+
 	logger := log.WithValues("HAEgressGatewayPolicy", haEgressGatewayPolicy.Name)
 
 	serviceNamespace := r.EgressNamespace
@@ -181,6 +190,9 @@ func (r *HAEgressGatewayPolicyReconciler) UpdateOrCreateCiliumEgressGatewayPolic
 
 func (r *HAEgressGatewayPolicyReconciler) UpdateOrCreateService(ctx context.Context, haEgressGatewayPolicy *haegressv2.HAEgressGatewayPolicy) error {
 	log := ctrl.LoggerFrom(ctx)
+
+	// Save the last update date in order to delay the next background check
+	r.lastServiceUpdate.Store(time.Now())
 
 	serviceNamespace := r.EgressNamespace
 	if haEgressGatewayPolicy.Annotations[haegressip.HAEgressGatewayPolicyNamespace] != "" {
@@ -287,8 +299,55 @@ func (r *HAEgressGatewayPolicyReconciler) findObjectsForHaegressGatewayPolicy(ct
 	return requests
 }
 
+func (r *HAEgressGatewayPolicyReconciler) backgroundPeriodicalCheck(ctx context.Context) {
+	log := ctrl.LoggerFrom(ctx)
+	ticker := time.NewTicker(time.Duration(r.BackgroundCheckerSeconds) * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Manage concurrency, avoid update if the latest change happened recently, less than
+			// half of the background checker period
+			lastUpdate := r.lastServiceUpdate.Load().(time.Time)
+			if time.Since(lastUpdate) < (time.Duration(r.BackgroundCheckerSeconds/2) * time.Second) {
+				log.Info("Last object update too recent, skipping periodic check",
+					"lastUpdate", lastUpdate)
+				continue
+			}
+
+			var policies haegressv2.HAEgressGatewayPolicyList
+			if err := r.List(ctx, &policies); err != nil {
+				log.Error(err, "failed to list HAEgressGatewayPolicies")
+				continue
+			}
+
+			for _, policy := range policies.Items {
+				log.Info("Periodic check of HAEgressGatewayPolicy",
+					"Name", policy.Name,
+					"Namespace", policy.Namespace)
+
+				if err := r.UpdateOrCreateCiliumEgressGatewayPolicy(ctx, &policy); err != nil {
+					log.Error(err, "failed to update CiliumEgressGatewayPolicy")
+				}
+
+				if err := r.UpdateOrCreateService(ctx, &policy); err != nil {
+					log.Error(err, "failed to update Service")
+				}
+			}
+		}
+	}
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *HAEgressGatewayPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.BackgroundCheckerSeconds > 0 {
+		ctx := context.Background()
+		go r.backgroundPeriodicalCheck(ctx)
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&haegressv2.HAEgressGatewayPolicy{}).
 		Watches(
