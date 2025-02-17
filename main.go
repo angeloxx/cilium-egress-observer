@@ -18,6 +18,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"os"
 
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
@@ -41,6 +42,8 @@ var (
 	setupLog = ctrl.Log.WithName("setup")
 )
 
+const inClusterNamespacePath = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	err := ciliumv2.AddToScheme(scheme)
@@ -61,6 +64,7 @@ func main() {
 	var k8sClientQPS int
 	var k8sClientBurst int
 	var backgroundCheckerSeconds int
+	var leaderElectionNamespace string
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -73,6 +77,8 @@ func main() {
 	flag.IntVar(&k8sClientQPS, "k8s-client-qps", 20, "The maximum QPS to the Kubernetes API server")
 	flag.IntVar(&k8sClientBurst, "k8s-client-burst", 100, "The maximum burst for throttle to the Kubernetes API server")
 	flag.IntVar(&backgroundCheckerSeconds, "background-checker-seconds", 60, "The time in seconds to check all the HAEgressGatewayPolicies in the background, zero to disable it")
+	flag.StringVar(&leaderElectionNamespace, "leader-election-namespace", "", "The namespace where the leader election lease will be created, if empty it will try to find the namespace from the environment")
+
 	opts := zap.Options{
 		Development: false,
 	}
@@ -87,14 +93,23 @@ func main() {
 	config.QPS = float32(k8sClientQPS)
 	config.Burst = k8sClientBurst
 
+	if leaderElectionNamespace == "" {
+		var err error
+		leaderElectionNamespace, err = getInClusterNamespace()
+		if err != nil {
+			setupLog.Error(err, "error checking the leader election namespace")
+		}
+	}
+
 	mgr, err := ctrl.NewManager(config, ctrl.Options{
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
 			BindAddress: metricsAddr,
 		},
-		HealthProbeBindAddress: probeAddr,
-		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "cilium-haegress-operator.angeloxx.ch",
+		HealthProbeBindAddress:  probeAddr,
+		LeaderElection:          enableLeaderElection,
+		LeaderElectionID:        "cilium-haegress-operator.angeloxx.ch",
+		LeaderElectionNamespace: leaderElectionNamespace,
 
 		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
 		// when the Manager ends. This requires the binary to immediately end when the
@@ -152,4 +167,22 @@ func main() {
 		setupLog.Error(err, "Problem running manager")
 		os.Exit(1)
 	}
+}
+
+func getInClusterNamespace() (string, error) {
+	// Check whether the namespace file exists.
+	// If not, we are not running in cluster so can't guess the namespace.
+	_, err := os.Stat(inClusterNamespacePath)
+	if os.IsNotExist(err) {
+		return "", fmt.Errorf("not running in a cluster, please supply --cluster-resource-namespace: %w", err)
+	} else if err != nil {
+		return "", fmt.Errorf("error checking namespace file: %w", err)
+	}
+
+	// Load the namespace file and return its content
+	namespace, err := os.ReadFile(inClusterNamespacePath)
+	if err != nil {
+		return "", fmt.Errorf("error reading namespace file: %w", err)
+	}
+	return string(namespace), nil
 }
