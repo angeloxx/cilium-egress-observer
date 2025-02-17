@@ -311,10 +311,15 @@ func (r *HAEgressGatewayPolicyReconciler) backgroundPeriodicalCheck(ctx context.
 		case <-ticker.C:
 			// Manage concurrency, avoid update if the latest change happened recently, less than
 			// half of the background checker period
-			lastUpdate := r.lastServiceUpdate.Load().(time.Time)
-			if time.Since(lastUpdate) < (time.Duration(r.BackgroundCheckerSeconds/2) * time.Second) {
-				log.Info("Last object update too recent, skipping periodic check",
-					"lastUpdate", lastUpdate)
+			if lastUpdate, ok := r.lastServiceUpdate.Load().(time.Time); ok {
+				if time.Since(lastUpdate) < (time.Duration(r.BackgroundCheckerSeconds/2) * time.Second) {
+					log.Info("Last object update too recent, skipping periodic check",
+						"lastUpdate", lastUpdate)
+					continue
+				}
+			} else {
+				log.V(1).Info("No previous update recorded, initializing timestamp")
+				r.lastServiceUpdate.Store(time.Now())
 				continue
 			}
 
@@ -345,7 +350,10 @@ func (r *HAEgressGatewayPolicyReconciler) backgroundPeriodicalCheck(ctx context.
 func (r *HAEgressGatewayPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.BackgroundCheckerSeconds > 0 {
 		ctx := context.Background()
-		go r.backgroundPeriodicalCheck(ctx)
+		go func() {
+			<-mgr.Elected()
+			r.backgroundPeriodicalCheck(ctx)
+		}()
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
